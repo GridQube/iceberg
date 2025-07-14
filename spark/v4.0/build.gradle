@@ -20,6 +20,11 @@
 String sparkMajorVersion = '4.0'
 String scalaVersion = '2.13'
 
+JavaVersion javaVersion = JavaVersion.current()
+if (javaVersion != JavaVersion.VERSION_17 && javaVersion != JavaVersion.VERSION_21) {
+  throw new GradleException("Spark 4.0 build requires JDK 17 or 21 but was executed with JDK " + javaVersion)
+}
+
 def sparkProjects = [
     project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}"),
     project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVersion}"),
@@ -180,6 +185,7 @@ project(":iceberg-spark:iceberg-spark-extensions-${sparkMajorVersion}_${scalaVer
     // runtime dependencies for running REST Catalog based integration test
     testRuntimeOnly libs.jetty.servlet
     testRuntimeOnly libs.sqlite.jdbc
+
     testImplementation libs.avro.avro
     testImplementation libs.parquet.hadoop
     testImplementation libs.awaitility
@@ -255,7 +261,6 @@ project(":iceberg-spark:iceberg-spark-runtime-${sparkMajorVersion}_${scalaVersio
 
     integrationImplementation "org.scala-lang.modules:scala-collection-compat_${scalaVersion}:${libs.versions.scala.collection.compat.get()}"
     integrationImplementation "org.apache.spark:spark-hive_${scalaVersion}:${libs.versions.spark40.get()}"
-    integrationImplementation libs.junit.vintage.engine
     integrationImplementation libs.junit.jupiter
     integrationImplementation libs.junit.platform.launcher
     integrationImplementation libs.slf4j.simple

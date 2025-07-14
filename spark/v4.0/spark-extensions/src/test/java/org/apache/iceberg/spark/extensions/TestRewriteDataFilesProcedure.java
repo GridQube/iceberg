@@ -22,19 +22,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.IntStream;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.EnvironmentContext;
+import org.apache.iceberg.Files;
 import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.PartitionStatisticsFile;
+import org.apache.iceberg.PartitionStats;
+import org.apache.iceberg.PartitionStatsHandler;
+import org.apache.iceberg.Partitioning;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.SnapshotSummary;
+import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.NamedReference;
 import org.apache.iceberg.expressions.Zorder;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.ExtendedParser;
@@ -131,6 +140,49 @@ public class TestRewriteDataFilesProcedure extends ExtensionsTestBase {
 
     List<Object[]> actualRecords = currentData();
     assertEquals("Data after compaction should not change", expectedRecords, actualRecords);
+  }
+
+  @TestTemplate
+  public void testPartitionStatsIncrementalCompute() throws IOException {
+    createPartitionTable();
+    // create 5 files for each partition (c2 = 'foo' and c2 = 'bar')
+    insertData(10);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    PartitionStatisticsFile statisticsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+    table.updatePartitionStatistics().setPartitionStatistics(statisticsFile).commit();
+
+    Schema dataSchema = PartitionStatsHandler.schema(Partitioning.partitionType(table));
+    List<PartitionStats> statsBeforeCompaction;
+    try (CloseableIterable<PartitionStats> recordIterator =
+        PartitionStatsHandler.readPartitionStatsFile(
+            dataSchema, Files.localInput(statisticsFile.path()))) {
+      statsBeforeCompaction = Lists.newArrayList(recordIterator);
+    }
+
+    sql("CALL %s.system.rewrite_data_files(table => '%s')", catalogName, tableIdent);
+
+    table.refresh();
+    statisticsFile =
+        PartitionStatsHandler.computeAndWriteStatsFile(table, table.currentSnapshot().snapshotId());
+    table.updatePartitionStatistics().setPartitionStatistics(statisticsFile).commit();
+    List<PartitionStats> statsAfterCompaction;
+    try (CloseableIterable<PartitionStats> recordIterator =
+        PartitionStatsHandler.readPartitionStatsFile(
+            dataSchema, Files.localInput(statisticsFile.path()))) {
+      statsAfterCompaction = Lists.newArrayList(recordIterator);
+    }
+
+    for (int index = 0; index < statsBeforeCompaction.size(); index++) {
+      PartitionStats statsAfter = statsAfterCompaction.get(index);
+      PartitionStats statsBefore = statsBeforeCompaction.get(index);
+
+      assertThat(statsAfter.partition()).isEqualTo(statsBefore.partition());
+      // data count should match after compaction
+      assertThat(statsAfter.dataRecordCount()).isEqualTo(statsBefore.dataRecordCount());
+      // file count should not match as new file count will be one after compaction
+      assertThat(statsAfter.dataFileCount()).isNotEqualTo(statsBefore.dataFileCount());
+    }
   }
 
   @TestTemplate
@@ -716,20 +768,25 @@ public class TestRewriteDataFilesProcedure extends ExtensionsTestBase {
     assertThatThrownBy(
             () -> sql("CALL %s.system.rewrite_data_files('n', table => 't')", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessageContaining("Named and positional arguments cannot be mixed");
+        .hasMessage(
+            "[DUPLICATE_ROUTINE_PARAMETER_ASSIGNMENT.BOTH_POSITIONAL_AND_NAMED] Call to routine `rewrite_data_files` is invalid because it includes multiple argument assignments to the same parameter name `table`. A positional argument and named argument both referred to the same parameter. Please remove the named argument referring to this parameter. SQLSTATE: 4274K");
 
     assertThatThrownBy(() -> sql("CALL %s.custom.rewrite_data_files('n', 't')", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessage("Catalog %s does not support procedures.", catalogName);
+        .hasMessage(
+            "[FAILED_TO_LOAD_ROUTINE] Failed to load routine `%s`.`custom`.`rewrite_data_files`. SQLSTATE: 38000",
+            catalogName);
 
     assertThatThrownBy(() -> sql("CALL %s.system.rewrite_data_files()", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessage("Missing required parameters: [table]");
+        .hasMessage(
+            "[REQUIRED_PARAMETER_NOT_FOUND] Cannot invoke routine `rewrite_data_files` because the parameter named `table` is required, but the routine call did not supply a value. Please update the routine call to supply an argument value (either positionally at index 0 or by name) and retry the query again. SQLSTATE: 4274K");
 
     assertThatThrownBy(
             () -> sql("CALL %s.system.rewrite_data_files(table => 't', table => 't')", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessageEndingWith("Duplicate procedure argument: table");
+        .hasMessageEndingWith(
+            "[DUPLICATE_ROUTINE_PARAMETER_ASSIGNMENT.DOUBLE_NAMED_ARGUMENT_REFERENCE] Call to routine `rewrite_data_files` is invalid because it includes multiple argument assignments to the same parameter name `table`. More than one named argument referred to the same parameter. Please assign a value only once. SQLSTATE: 4274K");
 
     assertThatThrownBy(() -> sql("CALL %s.system.rewrite_data_files('')", catalogName))
         .isInstanceOf(IllegalArgumentException.class)

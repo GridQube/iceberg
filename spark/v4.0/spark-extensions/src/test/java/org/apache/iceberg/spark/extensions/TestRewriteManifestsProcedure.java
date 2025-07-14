@@ -22,17 +22,27 @@ import static org.apache.iceberg.TableProperties.SNAPSHOT_ID_INHERITANCE_ENABLED
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.List;
+import org.apache.iceberg.Files;
 import org.apache.iceberg.ParameterizedTestExtension;
+import org.apache.iceberg.PartitionStatisticsFile;
+import org.apache.iceberg.PartitionStats;
+import org.apache.iceberg.PartitionStatsHandler;
+import org.apache.iceberg.Partitioning;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.spark.sql.AnalysisException;
 import org.apache.spark.sql.RowFactory;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.TestTemplate;
 import org.junit.jupiter.api.extension.ExtendWith;
 
@@ -256,7 +266,7 @@ public class TestRewriteManifestsProcedure extends ExtensionsTestBase {
         .hasSize(1);
   }
 
-  @TestTemplate
+  @Disabled("Spark SQL does not support case insensitive for named arguments")
   public void testRewriteManifestsCaseInsensitiveArgs() {
     sql(
         "CREATE TABLE %s (id bigint NOT NULL, data string) USING iceberg PARTITIONED BY (data)",
@@ -289,24 +299,30 @@ public class TestRewriteManifestsProcedure extends ExtensionsTestBase {
     assertThatThrownBy(
             () -> sql("CALL %s.system.rewrite_manifests('n', table => 't')", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessage("Named and positional arguments cannot be mixed");
+        .hasMessage(
+            "[DUPLICATE_ROUTINE_PARAMETER_ASSIGNMENT.BOTH_POSITIONAL_AND_NAMED] Call to routine `rewrite_manifests` is invalid because it includes multiple argument assignments to the same parameter name `table`. A positional argument and named argument both referred to the same parameter. Please remove the named argument referring to this parameter. SQLSTATE: 4274K");
 
     assertThatThrownBy(() -> sql("CALL %s.custom.rewrite_manifests('n', 't')", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessage("Catalog %s does not support procedures.", catalogName);
+        .hasMessage(
+            "[FAILED_TO_LOAD_ROUTINE] Failed to load routine `%s`.`custom`.`rewrite_manifests`. SQLSTATE: 38000",
+            catalogName);
 
     assertThatThrownBy(() -> sql("CALL %s.system.rewrite_manifests()", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessage("Missing required parameters: [table]");
+        .hasMessage(
+            "[REQUIRED_PARAMETER_NOT_FOUND] Cannot invoke routine `rewrite_manifests` because the parameter named `table` is required, but the routine call did not supply a value. Please update the routine call to supply an argument value (either positionally at index 0 or by name) and retry the query again. SQLSTATE: 4274K");
 
     assertThatThrownBy(() -> sql("CALL %s.system.rewrite_manifests('n', 2.2)", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessageStartingWith("Wrong arg type for use_caching");
+        .hasMessageStartingWith(
+            "[DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE] Cannot resolve CALL due to data type mismatch: The second parameter requires the \"BOOLEAN\" type, however \"2.2\" has the type \"DECIMAL(2,1)\". SQLSTATE: 42K09");
 
     assertThatThrownBy(
             () -> sql("CALL %s.system.rewrite_manifests(table => 't', tAbLe => 't')", catalogName))
         .isInstanceOf(AnalysisException.class)
-        .hasMessage("Could not build name to arg map: Duplicate procedure argument: table");
+        .hasMessage(
+            "[UNRECOGNIZED_PARAMETER_NAME] Cannot invoke routine `rewrite_manifests` because the routine call included a named argument reference for the argument named `tAbLe`, but this routine does not include any signature containing an argument with this name. Did you mean one of the following? [`table` `spec_id` `use_caching`]. SQLSTATE: 4274K");
 
     assertThatThrownBy(() -> sql("CALL %s.system.rewrite_manifests('')", catalogName))
         .isInstanceOf(IllegalArgumentException.class)
@@ -380,5 +396,53 @@ public class TestRewriteManifestsProcedure extends ExtensionsTestBase {
         "Should have 2 manifests and their partition spec id should be 0 and 1",
         ImmutableList.of(row(0), row(1)),
         sql("SELECT partition_spec_id FROM %s.manifests order by 1 asc", tableName));
+  }
+
+  @TestTemplate
+  public void testPartitionStatsIncrementalCompute() throws IOException {
+    sql(
+        "CREATE TABLE %s (id bigint NOT NULL, data string) USING iceberg PARTITIONED BY (data)",
+        tableName);
+
+    sql("INSERT INTO TABLE %s VALUES (1, 'a')", tableName);
+    sql("INSERT INTO TABLE %s VALUES (2, 'b')", tableName);
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    PartitionStatisticsFile statisticsFile = PartitionStatsHandler.computeAndWriteStatsFile(table);
+    table.updatePartitionStatistics().setPartitionStatistics(statisticsFile).commit();
+
+    Schema dataSchema = PartitionStatsHandler.schema(Partitioning.partitionType(table));
+    List<PartitionStats> statsBeforeRewrite;
+    try (CloseableIterable<PartitionStats> recordIterator =
+        PartitionStatsHandler.readPartitionStatsFile(
+            dataSchema, Files.localInput(statisticsFile.path()))) {
+      statsBeforeRewrite = Lists.newArrayList(recordIterator);
+    }
+
+    sql(
+        "CALL %s.system.rewrite_manifests(use_caching => false, table => '%s')",
+        catalogName, tableIdent);
+
+    table.refresh();
+    statisticsFile =
+        PartitionStatsHandler.computeAndWriteStatsFile(table, table.currentSnapshot().snapshotId());
+    table.updatePartitionStatistics().setPartitionStatistics(statisticsFile).commit();
+    List<PartitionStats> statsAfterRewrite;
+    try (CloseableIterable<PartitionStats> recordIterator =
+        PartitionStatsHandler.readPartitionStatsFile(
+            dataSchema, Files.localInput(statisticsFile.path()))) {
+      statsAfterRewrite = Lists.newArrayList(recordIterator);
+    }
+
+    for (int index = 0; index < statsBeforeRewrite.size(); index++) {
+      PartitionStats statsAfter = statsAfterRewrite.get(index);
+      PartitionStats statsBefore = statsBeforeRewrite.get(index);
+
+      assertThat(statsAfter.partition()).isEqualTo(statsBefore.partition());
+      // data count should match
+      assertThat(statsAfter.dataRecordCount()).isEqualTo(statsBefore.dataRecordCount());
+      // file count should match
+      assertThat(statsAfter.dataFileCount()).isEqualTo(statsBefore.dataFileCount());
+    }
   }
 }

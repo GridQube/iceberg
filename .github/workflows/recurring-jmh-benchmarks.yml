@@ -41,7 +41,7 @@ jobs:
                     "IcebergSourceNestedParquetDataReadBenchmark", "IcebergSourceNestedParquetDataWriteBenchmark",
                     "IcebergSourceParquetEqDeleteBenchmark", "IcebergSourceParquetMultiDeleteFileBenchmark",
                     "IcebergSourceParquetPosDeleteBenchmark", "IcebergSourceParquetWithUnrelatedDeleteBenchmark"]
-        spark_version: ['iceberg-spark-4.0']
+        spark_version: ['iceberg-spark-3.5']
     env:
       SPARK_LOCAL_IP: localhost
     steps:
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: zulu
-          java-version: 11
+          java-version: 17
       - uses: actions/cache@v4
         with:
           path: |
