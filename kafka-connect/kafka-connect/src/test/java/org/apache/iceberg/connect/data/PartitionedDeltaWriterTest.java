@@ -32,7 +32,7 @@ import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.junit.jupiter.api.Test;
 
-public class PartitionedDeltaWriterTest extends BaseWriterTest {
+public class PartitionedDeltaWriterTest extends WriterTestBase {
 
   @Test
   public void testPartitionedDeltaWriter() {
